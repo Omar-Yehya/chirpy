@@ -1,75 +1,114 @@
-package main 
+package main
 
+import (
+	"chirpy/internal/database"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"sync/atomic"
+	"time"
 
-import ("net/http"
-        "log"
-        "fmt"
-        "sync/atomic"
-        "encoding/json"
-        "strings"
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
-
-type apiConfig struct{
-    fileserverHits atomic.Int32
-    
+type apiConfig struct {
+	fileserverHits atomic.Int32
+	db             *database.Queries
+	platform       string
 }
 
-type chirpy struct{
-    Body string `json:"body"`
+type ChirpResponse struct { // Add here, just after other type definitions
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
-func main(){
+// JSON STRUCT BODY WAS HERE
 
+func main() {
 
-apiCfg:=&apiConfig{}
-    
+	godotenv.Load()
 
-serveMux:=http.NewServeMux()
+	dbURL := os.Getenv("DB_URL")
+	if dbURL == "" {
+		log.Fatalf("DB_URL is not set in the .env file")
+	}
 
-Filehandler:= http.StripPrefix("/app", http.FileServer(http.Dir(".")))
-serveMux.Handle("/app/", apiCfg.middlewareMetricsInc(Filehandler))
-serveMux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
-serveMux.HandleFunc("POST /admin/reset", apiCfg.resetMetrics)
-serveMux.HandleFunc("/api/validate_chirp/v1", validateChirpHandler)
-serveMux.HandleFunc("/api/validate_chirp/v2", validChirp)
+	platform := os.Getenv("PLATFORM")
+	if platform == "" {
+		log.Fatal("PLATFORM must be set")
+	}
 
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("DB_url must be set")
+	}
 
+	Queries := database.New(db)
 
-serveMux.HandleFunc("GET /api/healthz", healthHandler)
+	apiCfg := &apiConfig{
+		db:       Queries,
+		platform: platform,
+	}
 
+	//WE CREATED A PALTFORM STRINF TO SEE THE .env AND READ IF ITS SOEMTHINGTHAT SHOULD BE DONE
 
-server:=&http.Server{
+	//serveMux := http.NewServeMux()  old way that requires function check (Post,Get,...)
+	r := mux.NewRouter()
+	Filehandler := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
+	r.PathPrefix("/app/").Handler(apiCfg.middlewareMetricsInc(Filehandler))
 
-    Handler: serveMux,
-    Addr: ":8080",
+	// Health check endpoint
+	r.HandleFunc("/api/healthz", healthHandler).Methods("GET")
 
-    }
-log.Fatal(server.ListenAndServe())
+	// User creation endpoint
+	r.HandleFunc("/api/users", apiCfg.createUser).Methods("POST")
 
+	// Chirps endpoints
+	r.HandleFunc("/api/chirps", apiCfg.createChirpHandler).Methods("POST")
+	r.HandleFunc("/api/chirps", apiCfg.handlerChirpsRetrieve).Methods("GET")
+	r.HandleFunc("/api/chirps/{chirpID}", apiCfg.handlerChirpsGet).Methods("GET")
 
+	// Admin endpoints
+	r.HandleFunc("/admin/metrics", apiCfg.metricsHandler).Methods("GET")
+	r.HandleFunc("/admin/reset", apiCfg.resetMetrics).Methods("POST")
+	server := &http.Server{
 
+		Handler: r,
+		Addr:    ":8080",
+	}
+	log.Fatal(server.ListenAndServe())
 
 }
 
-func healthHandler(w http.ResponseWriter, r * http.Request){
-    w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-    w.WriteHeader(http.StatusOK)
-    w.Write([]byte(http.StatusText(http.StatusOK)))
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(http.StatusText(http.StatusOK)))
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    cfg.fileserverHits.Add(1)
-    next.ServeHTTP(w,r)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg.fileserverHits.Add(1)
+		next.ServeHTTP(w, r)
 
-    })
+	})
 }
 
-func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request){
+func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request) {
 
-    hitsCount:= cfg.fileserverHits.Load()
-    FormattedHTML:=fmt.Sprintf(`
+	hitsCount := cfg.fileserverHits.Load()
+	FormattedHTML := fmt.Sprintf(`
     
         <html>
             <body>
@@ -79,100 +118,234 @@ func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request){
         </html>
     
     
-    `,hitsCount)
-    
-    w.Header().Set("Content-Type", "text/html")
-    w.Write([]byte(FormattedHTML))
+    `, hitsCount)
 
-
-}
-
-func (cfg *apiConfig) resetMetrics(w http.ResponseWriter, r *http.Request){
- cfg.fileserverHits.Store(0)
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(FormattedHTML))
 
 }
 
-// checks valid and functional chirpy tweet 
-func validateChirpHandler(w http.ResponseWriter, r *http.Request){
- 
-    decoder:=json.NewDecoder(r.Body)
+func (cfg *apiConfig) resetMetrics(w http.ResponseWriter, r *http.Request) {
 
-    params:=chirpy{}
-    err:=decoder.Decode(&params)
-    if err != nil{
-        log.Printf("Error Decoding: %s", err)
-        w.WriteHeader(400)
-        return
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-    }
+	if cfg.platform != "dev" {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("Reset is only allowed in dev enviroment"))
+		return
+	}
 
-
-    if  len(params.Body)> 140{
-        response:= map[string] string{"error": "Chirp is too long"}
-        dat, err := json.Marshal(response)
-        if err != nil{
-            log.Printf("Error marshalling JSON %s", err)
-            w.WriteHeader(500)
-            return 
-        }
-        
-    
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(400)
-        w.Write(dat)
-    }else{
-        response:=map[string] bool{"valid": true}
-        dat,err:=json.Marshal(response)
-        if err != nil{
-            log.Printf("Error marshalling JSON %s", err)
-            w.WriteHeader(500)
-            return 
-        }
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(200)
-        w.Write(dat)
-
-    }
+	cfg.fileserverHits.Store(0)
+	cfg.db.Reset(r.Context())
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Hits reset to 0 and database reset to inital state."))
 
 }
 
-// Filters bad words 
-func validWord(input string) string {
+// checks valid and functional chirpy tweet
 
-    bad_words:=[]string{"kerfuffle", "sharbert", "fornax"}
+func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request) {
 
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	type parameters struct {
+		Body   string    `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
+	}
 
-    words:=strings.Split(strings.ToLower(input)," ")
+	decoder := json.NewDecoder(r.Body)
 
-    for i,word:= range words{
-        for _,badWord:= range bad_words{
-            if word ==badWord{
-                words[i]="****"
-            }
-        }
-        
-    }
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters", err)
+		return
+	}
+	cleaned, err := validateChirp(params.Body)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, err.Error(), err)
+		return
+	}
 
-    Cencored_text := strings.Join(words, " ")
-    return Cencored_text
+	chirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
+		Body:   cleaned,
+		UserID: params.UserID,
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create chirp", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, ChirpResponse{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	})
+
 }
 
-func validChirp(w http.ResponseWriter, r *http.Request){
-    var Chirpdata chirpy
-    decoder:=json.NewDecoder(r.Body)
-    if err:= decoder.Decode(&Chirpdata); err!=nil{
-        http.Error(w, "Bad request", http.StatusBadRequest )
-        return 
-    }
+func validateChirp(body string) (string, error) {
+	if len(body) > 140 {
+		return "", errors.New("chirp is too long")
+	}
 
-    cleandBody:=validWord(Chirpdata.Body)
-    response:=map[string]string{"cleaned_body": cleandBody}
+	badWords := map[string]struct{}{
+		"kerfuffle": {},
+		"sharbert":  {},
+		"fornax":    {},
+	}
+	cleaned := getCleanedBody(body, badWords)
 
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(response)
+	return cleaned, nil
 
+}
 
+// Filters bad words
+func getCleanedBody(body string, badWords map[string]struct{}) string {
 
+	words := strings.Split(body, " ")
+	for i, word := range words {
+		loweredWord := strings.ToLower(word)
+		if _, ok := badWords[loweredWord]; ok {
+			words[i] = "****"
+		}
+	}
+	cleaned := strings.Join(words, " ")
+	return cleaned
 
+}
 
+func respondWithError(w http.ResponseWriter, code int, msg string, err error) {
+	if err != nil {
+		log.Println(err)
+	}
+	if code > 499 {
+		log.Printf("Responding with 5XX error: %s", msg)
+	}
+	type errorResponse struct {
+		Error string `json:"error"`
+	}
+	respondWithJSON(w, code, errorResponse{
+		Error: msg,
+	})
+}
+
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	dat, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshalling JSON: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+	w.WriteHeader(code)
+	w.Write(dat)
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type parameters struct {
+		Email string `json:"email"`
+	}
+	type response struct {
+		User
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters", err)
+		return
+
+	}
+	user, err := cfg.db.CreateUser(r.Context(), params.Email)
+	if err != nil {
+		log.Printf("Database error: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create user", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, response{
+		User: User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		},
+	})
+
+}
+
+func (cfg *apiConfig) handlerChirpsRetrieve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dbChirps, err := cfg.db.GetAllChirps(r.Context())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn`t retrieve chirps", err)
+		return
+	}
+
+	chirps := []ChirpResponse{}
+
+	for _, dbChirp := range dbChirps {
+		chirps = append(chirps, ChirpResponse{
+			ID:        dbChirp.ID,
+			CreatedAt: dbChirp.CreatedAt,
+			UpdatedAt: dbChirp.UpdatedAt,
+			UserID:    dbChirp.UserID,
+			Body:      dbChirp.Body,
+		})
+	}
+	respondWithJSON(w, http.StatusOK, chirps)
+
+}
+
+func (cfg *apiConfig) handlerChirpsGet(w http.ResponseWriter, r *http.Request) {
+
+	vars := mux.Vars(r)
+	chirpIDString := vars["chirpID"]
+
+	log.Printf("Extracted chirpIDString: %q", chirpIDString)
+
+	chirpID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID", err)
+		return
+	}
+
+	dbChirp, err := cfg.db.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Couldn't get chirp", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, ChirpResponse{
+		ID:        dbChirp.ID,
+		CreatedAt: dbChirp.CreatedAt,
+		UpdatedAt: dbChirp.UpdatedAt,
+		UserID:    dbChirp.UserID,
+		Body:      dbChirp.Body,
+	})
 }
